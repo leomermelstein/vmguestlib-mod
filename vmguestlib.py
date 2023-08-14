@@ -17,22 +17,17 @@
 from ctypes import *
 from ctypes.util import find_library
 
-__author__ = 'Dag Wieers <dag@wieers.com>'
-__version__ = '0.1.2'
+__author__ = 'Dag Wieers <dag@wieers.com>, modified by Leo Mermelstein'
+__version__ = '0.1.5'
 __version_info__ = tuple([ int(d) for d in __version__.split('.') ])
 __license__ = 'GNU General Public License (GPL)'
 
-# TODO: Implement support for Windows and MacOSX, improve Linux support ?
 if find_library('vmGuestLib'):
     vmGuestLib = CDLL(find_library('vmGuestLib'))
 elif find_library('guestlib'):
     vmGuestLib = CDLL(find_library('guestlib'))
-#elif os.path.exists('/usr/lib/vmware-tools/lib/libvmGuestLib.so/libvmGuestLib.so'):
-#    vmGuestLib = CDLL('/usr/lib/vmware-tools/lib/libvmGuestLib.so/libvmGuestLib.so')
-#elif os.path.exists('%PROGRAMFILES%\\VMware\\VMware Tools\\Guest SDK\\vmStatsProvider\win32\\vmGuestLib.dll'):
-#    vmGuestLib = CDLL('%PROGRAMFILES%\\VMware\\VMware Tools\\Guest SDK\\vmStatsProvider\win32\\vmGuestLib.dll')
 else:
-    raise Exception, 'ERROR: Cannot find vmGuestLib library in LD_LIBRARY_PATH'
+    vmGuestLib = None
 
 VMGUESTLIB_ERROR_SUCCESS = 0
 VMGUESTLIB_ERROR_OTHER = 1
@@ -74,6 +69,7 @@ VMErrMsgs = (
     'The host does not support the requested statistic.',
 )
 
+
 class VMGuestLibException(Exception):
     '''Status code that indicates success orfailure. Each function returns a
        VMGuestLibError code. For information about specific error codes, see "vSphere
@@ -81,20 +77,83 @@ class VMGuestLibException(Exception):
        defined in vmGuestLib.h.'''
     def __init__(self, errno):
         self.errno = errno
-        self.GetErrorText = vmGuestLib.VMGuestLib_GetErrorText
-        self.GetErrorText.restype = c_char_p
-        self.message = self.GetErrorText(self.errno)
-        self.strerr = VMErrMsgs[self.errno]
+        if vmGuestLib is not None:
+            self.GetErrorText = vmGuestLib.VMGuestLib_GetErrorText
+            self.GetErrorText.restype = c_char_p
+            self.message = self.GetErrorText(self.errno)
+            self.strerr = VMErrMsgs[self.errno]
+        else:
+            self.GetErrorText = None
+            self.message = 'No vmGuestLib library'
+            self.strerr = str(errno)
 
     def __str__(self):
         return '%s\n%s' % (self.message, self.strerr)
 
-class VMGuestLib(Structure):
-    def __init__(self):
-        # Reference to virtualmachinedata. VMGuestLibHandle is defined in vmGuestLib.h.
-        self.handle = self.OpenHandle()
 
+class VMGuestLib:
+
+    def __init__(self):
+        self.handle = c_void_p()
+
+    def __enter__(self):
+        # Reference to virtualmachinedata. VMGuestLibHandle is defined in vmGuestLib.h.
+        self.OpenHandle()
         self.UpdateInfo()
+
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.CloseHandle()
+
+    @property
+    def vmguestlib(self):
+        if vmGuestLib is None:
+            raise VMGuestLibException(128)
+
+        return vmGuestLib
+
+    def OpenHandle(self):
+        '''Gets a handle for use with other vSphere Guest API functions. The guest library
+           handle provides a context for accessing information about the virtual machine.
+
+           Virtual machine statistics and state data are associated with a particular guest library
+           handle, so using one handle does not affect the data associated with another handle.'''
+        if self.handle.value != c_void_p().value:
+            return
+
+        handle = c_void_p()
+        ret = self.vmguestlib.VMGuestLib_OpenHandle(byref(handle))
+        if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
+        self.handle = handle
+
+    def CloseHandle(self):
+        '''Releases a handle acquired with VMGuestLib_OpenHandle'''
+        if self.handle.value == c_void_p().value:
+            return
+
+        ret = self.vmguestlib.VMGuestLib_CloseHandle(self.handle)
+        if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
+        self.handle = c_void_p()
+
+    def UpdateInfo(self):
+        '''Updates information about the virtual machine. This information is associated with
+           the VMGuestLibHandle.
+
+           VMGuestLib_UpdateInfo requires similar CPU resources to a system call and
+           therefore can affect performance. If you are concerned about performance, minimize
+           the number of calls to VMGuestLib_UpdateInfo.
+
+           If your program uses multiple threads, each thread must use a different handle.
+           Otherwise, you must implement a locking scheme around update calls. The vSphere
+           Guest API does not implement internal locking around access with a handle.'''
+        ret = self.vmguestlib.VMGuestLib_UpdateInfo(self.handle)
+        if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
+
+    def GetSessionId(self):
+        '''Retrieves the VMSessionID for the current session. Call this function after calling
+           VMGuestLib_UpdateInfo. If VMGuestLib_UpdateInfo has never been called,
+           VMGuestLib_GetSessionId returns VMGUESTLIB_ERROR_NO_INFO.'''
 
         # Unique identifier for a session. The session ID changes after a virtual machine is
         # migrated using VMotion, suspended and resumed, or reverted to a snapshot. Any of
@@ -109,58 +168,17 @@ class VMGuestLib(Structure):
         # calling VMGuestLib_UpdateInfo.
 
         # VMSessionID is defined in vmSessionId.h
-        self.sid = self.GetSessionId()
-
-    def OpenHandle(self):
-        '''Gets a handle for use with other vSphere Guest API functions. The guest library
-           handle provides a context for accessing information about the virtual machine.
-
-           Virtual machine statistics and state data are associated with a particular guest library
-           handle, so using one handle does not affect the data associated with another handle.'''
-        if hasattr(self, 'handle'):
-            return self.handle
-        else:
-            handle = c_void_p()
-            ret = vmGuestLib.VMGuestLib_OpenHandle(byref(handle))
-            if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
-            return handle
-
-    def CloseHandle(self):
-        '''Releases a handle acquired with VMGuestLib_OpenHandle'''
-        if hasattr(self, 'handle'):
-            ret = vmGuestLib.VMGuestLib_CloseHandle(self.handle)
-            if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
-            del(self.handle)
-
-    def UpdateInfo(self):
-        '''Updates information about the virtual machine. This information is associated with
-           the VMGuestLibHandle.
-
-           VMGuestLib_UpdateInfo requires similar CPU resources to a system call and
-           therefore can affect performance. If you are concerned about performance, minimize
-           the number of calls to VMGuestLib_UpdateInfo.
-
-           If your program uses multiple threads, each thread must use a different handle.
-           Otherwise, you must implement a locking scheme around update calls. The vSphere
-           Guest API does not implement internal locking around access with a handle.'''
-        ret = vmGuestLib.VMGuestLib_UpdateInfo(self.handle)
-        if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
-
-    def GetSessionId(self):
-        '''Retrieves the VMSessionID for the current session. Call this function after calling
-           VMGuestLib_UpdateInfo. If VMGuestLib_UpdateInfo has never been called,
-           VMGuestLib_GetSessionId returns VMGUESTLIB_ERROR_NO_INFO.'''
         sid = c_void_p()
-        ret = vmGuestLib.VMGuestLib_GetSessionId(self.handle, byref(sid))
+        ret = self.vmguestlib.VMGuestLib_GetSessionId(self.handle, byref(sid))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
-        return sid
+        return sid.value
 
     def GetCpuLimitMHz(self):
         '''Retrieves the upperlimit of processor use in MHz available to the virtual
            machine. For information about setting the CPU limit, see "Limits and
            Reservations" on page 14.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetCpuLimitMHz(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetCpuLimitMHz(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -169,7 +187,7 @@ class VMGuestLib(Structure):
            machine. For information about setting a CPU reservation, see "Limits and
            Reservations" on page 14.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetCpuReservationMHz(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetCpuReservationMHz(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -178,7 +196,7 @@ class VMGuestLib(Structure):
            information about how an ESX server uses CPU shares to manage virtual
            machine priority, see the vSphere Resource Management Guide.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetCpuShares(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetCpuShares(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -186,7 +204,7 @@ class VMGuestLib(Structure):
         '''Retrieves the number of milliseconds that the virtual machine was in a
            ready state (able to transition to a run state), but was not scheduled to run.'''
         counter = c_uint64()
-        ret = vmGuestLib.VMGuestLib_GetCpuStolenMs(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetCpuStolenMs(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -198,7 +216,7 @@ class VMGuestLib(Structure):
            (VMGuestLib_GetElapsedMs) to estimate the effective virtual machine
            CPU speed. This value is a subset of elapsedMs.'''
         counter = c_uint64()
-        ret = vmGuestLib.VMGuestLib_GetCpuUsedMs(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetCpuUsedMs(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -213,7 +231,7 @@ class VMGuestLib(Structure):
            (VMGuestLib_GetCpuUsedMs) to estimate the effective virtual machine
            CPU speed. cpuUsedMs is a subset of this value.'''
         counter = c_uint64()
-        ret = vmGuestLib.VMGuestLib_GetElapsedMs(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetElapsedMs(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -221,7 +239,7 @@ class VMGuestLib(Structure):
     def GetHostCpuUsedMs(self):
         '''Undocumented.'''
         counter = c_uint64()
-        ret = vmGuestLib.VMGuestLib_GetHostCpuUsedMs(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostCpuUsedMs(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -229,7 +247,7 @@ class VMGuestLib(Structure):
     def GetHostMemKernOvhdMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemKernOvhdMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemKernOvhdMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -237,7 +255,7 @@ class VMGuestLib(Structure):
     def GetHostMemMappedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemMappedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemMappedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -245,7 +263,7 @@ class VMGuestLib(Structure):
     def GetHostMemPhysFreeMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemPhysFreeMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemPhysFreeMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -253,7 +271,7 @@ class VMGuestLib(Structure):
     def GetHostMemPhysMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemPhysMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemPhysMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -261,7 +279,7 @@ class VMGuestLib(Structure):
     def GetHostMemSharedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemSharedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemSharedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -269,7 +287,7 @@ class VMGuestLib(Structure):
     def GetHostMemSwappedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemSwappedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemSwappedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -277,7 +295,7 @@ class VMGuestLib(Structure):
     def GetHostMemUnmappedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemUnmappedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemUnmappedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -285,7 +303,7 @@ class VMGuestLib(Structure):
     def GetHostMemUsedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostMemUsedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostMemUsedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -293,14 +311,14 @@ class VMGuestLib(Structure):
     def GetHostNumCpuCores(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostNumCpuCores(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostNumCpuCores(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
     def GetHostProcessorSpeed(self):
         '''Retrieves the speed of the ESX system's physical CPU in MHz.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetHostProcessorSpeed(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetHostProcessorSpeed(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -308,7 +326,7 @@ class VMGuestLib(Structure):
         '''Retrieves the amount of memory the virtual machine is actively using its
            estimated working set size.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemActiveMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemActiveMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -317,7 +335,7 @@ class VMGuestLib(Structure):
            machine by the vSphere memory balloon driver (also referred to as the
            "vmmemctl" driver).'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemBalloonedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemBalloonedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -325,7 +343,7 @@ class VMGuestLib(Structure):
     def GetMemBalloonMaxMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemBalloonMaxMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemBalloonMaxMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -333,7 +351,7 @@ class VMGuestLib(Structure):
     def GetMemBalloonTargetMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemBalloonTargetMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemBalloonTargetMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -342,7 +360,7 @@ class VMGuestLib(Structure):
            machine. For information about setting a memory limit, see "Limits and
            Reservations" on page 14.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemLimitMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemLimitMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -350,7 +368,7 @@ class VMGuestLib(Structure):
     def GetMemLLSwappedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemLLSwappedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemLLSwappedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -359,7 +377,7 @@ class VMGuestLib(Structure):
            Memory that is ballooned, swapped, or has never been accessed is
            excluded.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemMappedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemMappedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -369,7 +387,7 @@ class VMGuestLib(Structure):
            memory is additional memory that is reserved for data structures required
            by the virtualization layer.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemOverheadMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemOverheadMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -378,7 +396,7 @@ class VMGuestLib(Structure):
            machine. For information about setting a memory reservation, see "Limits
            and Reservations" on page 14.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemReservationMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemReservationMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -386,7 +404,7 @@ class VMGuestLib(Structure):
         '''Retrieves the amount of physical memory associated with this virtual
            machine that is copy-on-write (COW) shared on the host.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemSharedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemSharedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -394,7 +412,7 @@ class VMGuestLib(Structure):
         '''Retrieves the estimated amount of physical memory on the host saved
            from copy-on-write (COW) shared guest physical memory.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemSharedSavedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemSharedSavedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -403,7 +421,7 @@ class VMGuestLib(Structure):
            For information about how an ESX server uses memory shares to manage
            virtual machine priority, see the vSphere Resource Management Guide.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemShares(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemShares(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -411,7 +429,7 @@ class VMGuestLib(Structure):
         '''Retrieves the amount of memory that has been reclaimed from this virtual
            machine by transparently swapping guest memory to disk.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemSwappedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemSwappedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -419,14 +437,14 @@ class VMGuestLib(Structure):
     def GetMemSwapTargetMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemSwapTargetMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemSwapTargetMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
     def GetMemTargetSizeMB(self):
         '''Retrieves the size of the target memory allocation for this virtual machine.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemTargetSizeMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemTargetSizeMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -434,7 +452,7 @@ class VMGuestLib(Structure):
         '''Retrieves the estimated amount of physical host memory currently
            consumed for this virtual machine's physical memory.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemUsedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemUsedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -442,7 +460,7 @@ class VMGuestLib(Structure):
     def GetMemZippedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemZippedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemZippedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
 
@@ -450,8 +468,6 @@ class VMGuestLib(Structure):
     def GetMemZipSavedMB(self):
         '''Undocumented.'''
         counter = c_uint()
-        ret = vmGuestLib.VMGuestLib_GetMemZipSavedMB(self.handle, byref(counter))
+        ret = self.vmguestlib.VMGuestLib_GetMemZipSavedMB(self.handle, byref(counter))
         if ret != VMGUESTLIB_ERROR_SUCCESS: raise VMGuestLibException(ret)
         return counter.value
-
-# vim:ts=4:sw=4:et
